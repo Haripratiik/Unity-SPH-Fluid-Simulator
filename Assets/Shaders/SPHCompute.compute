@@ -1,0 +1,682 @@
+#pragma kernel Integrate // Use the force of each particle to move particle
+#pragma kernel ComputeForces // Compute forces for each particle
+#pragma kernel ComputeDensityPressure // Compute density/pressure for each particle
+#pragma kernel HashParticles
+#pragma kernel BitonicSort
+#pragma kernel CalculateCellOffsets
+
+struct Particle
+{
+    float pressure;
+    float density;
+    float3 currentForce;
+    float3 velocity;
+    float3 position;
+    float3 directionReflected;
+    float3 reflectedPosition;
+    //float collisionOccured;
+    //float collPointsIndex;
+};
+
+//Air particles
+RWStructuredBuffer<Particle> _particles;
+RWStructuredBuffer<uint> _particleIndices;
+RWStructuredBuffer<uint> _particleCellIndices;
+RWStructuredBuffer<uint> _cellOffsets;
+
+
+//Drug Particles
+struct DrugParticle
+{
+    float3 position;
+    float3 velocity;
+};
+
+RWStructuredBuffer<DrugParticle> _drugParticles;
+
+//Wall Mesh
+RWStructuredBuffer<float3> _wallMeshVertices;
+RWStructuredBuffer<uint> _wallMeshTriangles;
+RWStructuredBuffer<float3> _wallMeshNormals;
+
+//RWStructuredBuffer<float3> _collisionPoints;
+RWStructuredBuffer<float4> _collisionPoints;
+RWStructuredBuffer<float3> _collisionNormalVecs;
+
+// Variable Declarations 
+
+float3 initialFlowRateForce;
+
+float particleMass;
+float viscosity;
+float gasConstant;
+float restDensity;
+float boundDamping;
+float gasLocalVisc;
+float radius;
+float radius2;
+float radius3;
+float radius4;
+float radius5;
+float pi;
+uint particleLength;
+float timestep;
+float3 boxSize;
+//float3 box2Size;
+//loat3 box3Size;
+float3 spherePos;
+float sphereRadius;
+
+float drugParticleMass;
+uint drugLenght;
+float drugParticleCollisionThreshold;
+float drugParticleRadius;
+
+bool collisionDetected;
+float3 particlePositions;
+float collisionPointsLength;
+float collisionNormalVecsLength;
+
+//Mesh
+float collisionThreshold;
+uint wallMeshTrianglesLength;
+
+// Sorting variables
+
+int block;
+int dim;
+
+// Optimization
+
+int3 GetCell(float3 position)
+{
+    float3 halfS = boxSize / 2;
+    return int3((position.x + halfS.x) / radius, (position.y + halfS.y) / radius, (position.z + halfS.z) / radius);
+}
+
+inline uint HashCell(in int3 cellIndex)
+{
+
+    const uint p1 = 73856093; // some large primes
+    const uint p2 = 19349663;
+    const uint p3 = 83492791;
+
+    int n = p1 * cellIndex.x ^ p2 * cellIndex.y ^ p3 * cellIndex.z;
+    n %= particleLength;
+
+    return n;
+}
+
+[numthreads(256, 1, 1)]
+void HashParticles(uint3 id : SV_DISPATCHTHREADID)
+{
+
+    _cellOffsets[id.x] = 99999999; // Clear cell offsets
+
+    uint particleIndex = _particleIndices[id.x];
+    _particleCellIndices[particleIndex] = HashCell(GetCell(_particles[particleIndex].position));
+    particlePositions = float3(_particles[particleIndex].position.x, _particles[particleIndex].position.y, _particles[particleIndex].position.z);
+
+}
+
+[numthreads(256, 1, 1)]
+void BitonicSort(uint3 id : SV_DISPATCHTHREADID)
+{
+
+    uint i = id.x + id.y * 256 * 1024;
+    uint j = i ^ block;
+	
+    if (j < i || i >= particleLength) 
+        return;
+	
+    uint key_i = _particleIndices[i];
+    uint key_j = _particleIndices[j];
+    float value_i = _particleCellIndices[key_i];
+    float value_j = _particleCellIndices[key_j];
+	
+    float diff = (value_i - value_j) * ((i & dim) == 0 ? 1 : -1);
+    if (diff > 0)
+    {
+        _particleIndices[i] = key_j;
+        _particleIndices[j] = key_i;
+    }
+}
+
+[numthreads(256, 1, 1)]
+void CalculateCellOffsets(uint3 id : SV_DISPATCHTHREADID)
+{
+
+    uint particleIndex = _particleIndices[id.x];
+    uint cellIndex = _particleCellIndices[particleIndex];
+
+    InterlockedMin(_cellOffsets[cellIndex], id.x);
+
+}
+
+float PointToPlaneDistance(float3 particlePoint, float3 planePoint0, float3 planePoint1, float3 planePoint2, float3 planeNormal)
+{
+    float3 planePoint;
+    float nearestDist;
+    
+    for (int i = 0; i < 2; i++)
+    {
+        if (i == 0)
+        {
+            nearestDist = distance(planePoint0, particlePoint);
+            planePoint = planePoint0;
+        }
+        else if (i == 1)
+        {
+            if (distance(planePoint1, particlePoint) < nearestDist)
+            {
+                nearestDist = distance(planePoint1, particlePoint);
+                planePoint = planePoint1;
+            }
+        }
+        else if (i == 2)
+        {
+            if (distance(planePoint2, particlePoint) < nearestDist)
+            {
+                nearestDist = distance(planePoint2, particlePoint);
+                planePoint = planePoint2;
+            }
+        }
+    }
+    
+    return dot(planeNormal, particlePoint - planePoint);
+    //return particlePoint - planePoint;
+}
+
+bool IsPointInTriangle(float3 p, float3 v0, float3 v1, float3 v2)
+{
+    // Compute vectors
+    float3 v0v1 = v1 - v0;
+    float3 v0v2 = v2 - v0;
+    float3 v0p = p - v0;
+
+    // Compute dot products
+    float dot00 = dot(v0v2, v0v2);
+    float dot01 = dot(v0v2, v0v1);
+    float dot02 = dot(v0v2, v0p);
+    float dot11 = dot(v0v1, v0v1);
+    float dot12 = dot(v0v1, v0p);
+
+    // Compute barycentric coordinates
+    float invDenom = 1.0 / (dot00 * dot11 - dot01 * dot01);
+    float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+    float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+
+    // Check if point is in triangle
+    return (u >= 0) && (v >= 0) && (u + v <= 1);
+}
+
+float3 parametricPosition(float x0, float y0, float z0, float x1, float y1, float z1, float3 normal, float3 projectedPt, float3 reflectedDirection)
+{
+    float collisionTime;
+    
+    if (x1 != x0)
+    {
+        collisionTime = (radius * normal.x + projectedPt.x - x0) / (x1 - x0);
+    }
+    else if (y1 != y0)
+    {
+        collisionTime = (radius * normal.y + projectedPt.y - y0) / (y1 - y0);
+    }
+    else if (z1 != z0)
+    {
+        collisionTime = (radius * normal.z + projectedPt.z - z0) / (z1 - z0);
+    }
+  
+    float xPos = x0 + collisionTime * (x1 - x0);
+    float yPos = y0 + collisionTime * (y1 - y0);
+    float zPos = z0 + collisionTime * (z1 - z0);
+    
+    float3 collisionPosition = float3(xPos, yPos, zPos);
+    
+    float3 newPosition = collisionPosition + normalize(reflectedDirection) * abs(distance(float3(x0, y0, z0), float3(x1, y1, z1)) - distance(float3(x0, y0, z0), collisionPosition));
+
+    return newPosition;
+}
+
+
+[numthreads(256, 1, 1)]
+void Integrate(uint3 id : SV_DISPATCHTHREADID)
+{
+    float3 previousPosition = _particles[id.x].position;
+    
+    float3 vel = _particles[id.x].velocity + ((_particles[id.x].currentForce / particleMass) * timestep);
+    _particles[id.x].position += vel * timestep;
+    
+    float3 drugVel = _drugParticles[id.x].velocity;
+    _drugParticles[id.x].position += drugVel * timestep;
+
+    float3 topRight = boxSize / 2;
+    float3 bottomLeft = -boxSize / 2;
+    
+    /*
+    for (int i = 0; i < collisionPointsLength; i++)
+    {
+        float3 colPt = float3(_collisionPoints[i].x, _collisionPoints[i].y, _collisionPoints[i].z);
+        float dist = distance(_particles[id.x].position, colPt);
+        if (dist < radius)
+        {
+            float3 directionReflected = reflect(_particles[id.x].velocity, _particles[id.x].directionReflected);
+            vel = boundDamping * -1 * directionReflected;
+            //_particles[id.x].position = (radius / dist) * (_particles[id.x].position - _collisionPoints[i]) + _particles[id.x].position;
+            //_particles[id.x].position = _particles[id.x].reflectedPosition * radius + colPt;
+            //_particles[id.x].position = _particles[id.x].reflectedPosition;
+        }
+
+    }*/
+    
+    // Iterate over each triangle in the mesh
+    for (int n = 0; n < wallMeshTrianglesLength; n += 3)
+    {
+        drugParticleCollisionThreshold = drugParticleRadius;
+        
+        // Fetch the vertices and normal of the current triangle
+        float3 v0 = _wallMeshVertices[_wallMeshTriangles[n]];
+        float3 v1 = _wallMeshVertices[_wallMeshTriangles[n + 1]];
+        float3 v2 = _wallMeshVertices[_wallMeshTriangles[n + 2]];
+        float3 normal = normalize(cross(v1 - v0, v2 - v0));
+        //float3 normal = normalize(_wallMeshNormals[n / 3]);
+
+        // Step 1: Calculate the distance from the particle to the plane of the triangle
+        float distanceToPlane = PointToPlaneDistance(_particles[id.x].position, v0, v1, v2, normal);
+        float drugParticleDistanceToPlane = PointToPlaneDistance(_drugParticles[id.x].position, v0, v1, v2, normal);
+
+        // Step 2: If the particle is within the collision threshold, proceed
+        if (abs(distanceToPlane) < collisionThreshold * 0.5)
+        {
+            // Step 3: Project the particle onto the triangle's plane
+            float3 projectedPoint = _particles[id.x].position - normal * distanceToPlane;
+
+            // Step 4: Check if the projected point is inside the triangle
+            if (IsPointInTriangle(projectedPoint, v0, v1, v2))
+            {
+                //float3 normVec = normalize(_particles[id.x].position - projectedPoint);
+                float3 directionReflected = reflect(_particles[id.x].velocity, normal);
+                
+                // Adjust particle position to move it outside the mesh
+                _particles[id.x].position = projectedPoint + normal * (radius * 0.5f + 0.000000000000001f);
+                
+                //_particles[id.x].position = parametricPosition(previousPosition.x, previousPosition.y, previousPosition.z, _particles[id.x].position.x, _particles[id.x].position.y, _particles[id.x].position.z, normal, projectedPoint, directionReflected);
+                //_particles[id.x].position = projectedPoint + (radius + 0.0000000000001f) * (normalize(directionReflected));
+                
+                // Collision detected! Handle response, e.g., reflect velocity
+                //vel = boundDamping * reflect(_particles[id.x].velocity, normal);
+                //float3 normVec = normalize(_particles[id.x].position - projectedPoint);
+                vel = boundDamping * -1 * directionReflected;
+            }
+        }
+        
+        if (abs(drugParticleDistanceToPlane) < drugParticleCollisionThreshold * 0.5)
+        {
+            // Step 3: Project the particle onto the triangle's plane
+            float3 projectedPoint = _drugParticles[id.x].position - normal * drugParticleDistanceToPlane;
+
+            // Step 4: Check if the projected point is inside the triangle
+            if (IsPointInTriangle(projectedPoint, v0, v1, v2))
+            {
+                //float3 normVec = normalize(_particles[id.x].position - projectedPoint);
+                float3 directionReflected = reflect(_drugParticles[id.x].velocity, normal);
+                
+                // Adjust particle position to move it outside the mesh
+                _drugParticles[id.x].position = projectedPoint + normal * (drugParticleRadius * 0.5f + 0.000000000000001f);
+                
+                //_particles[id.x].position = parametricPosition(previousPosition.x, previousPosition.y, previousPosition.z, _particles[id.x].position.x, _particles[id.x].position.y, _particles[id.x].position.z, normal, projectedPoint, directionReflected);
+                //_particles[id.x].position = projectedPoint + (radius + 0.0000000000001f) * (normalize(directionReflected));
+                
+                // Collision detected! Handle response, e.g., reflect velocity
+                //vel = boundDamping * reflect(_particles[id.x].velocity, normal);
+                //float3 normVec = normalize(_particles[id.x].position - projectedPoint);
+                drugVel = boundDamping * -1 * directionReflected;
+            }
+        }
+    }
+    
+    for (int k = 0; k < particleLength; k++)
+    {
+        float dist = distance(_particles[id.x].position, _particles[k].position);
+        if (dist != 0)
+        {
+            if (dist < radius)
+            {
+                float3 normVec = normalize(_particles[id.x].position - _particles[k].position);
+                float3 directionReflected = reflect(_particles[id.x].velocity, normVec);
+                vel = boundDamping * -1 * directionReflected;
+                
+                _particles[id.x].position = _particles[k].position + normVec * (radius + 0.000000000000000001f);
+
+            }
+        }
+    }
+  
+    for (int l = 0; l < drugLenght; l++)
+    {
+        float dist = distance(_particles[id.x].position, _drugParticles[l].position);
+        if (dist != 0)
+        {
+            if (dist < (radius + drugParticleRadius) * 0.5)
+            {
+                float3 normVec = normalize(_particles[id.x].position - _drugParticles[l].position);
+                float3 directionReflected = reflect(_particles[id.x].velocity, normVec);
+                float3 newVel = _particles[id.x].velocity - 2 * (drugParticleMass / (drugParticleMass + particleMass)) * dot(_particles[id.x].velocity - _drugParticles[l].velocity, normVec) * normVec;
+                vel = boundDamping * -1 * newVel;
+                
+                _particles[id.x].position = _drugParticles[l].position + normVec * (radius + drugParticleRadius + 0.000000000000000001f) * 0.5;
+
+            }
+        }
+    }
+    
+    
+    for (int m = 0; m < drugLenght; m++)
+    {
+        float dist = distance(_drugParticles[id.x].position, _drugParticles[m].position);
+        if (dist != 0)
+        {
+            if (dist < drugParticleRadius)
+            {
+                float3 normVec = normalize(_drugParticles[id.x].position - _drugParticles[m].position);
+                float3 directionReflected = reflect(_drugParticles[id.x].velocity, normVec);
+                drugVel = boundDamping * -1 * directionReflected;
+                
+                _drugParticles[id.x].position = _drugParticles[m].position + normVec * (drugParticleRadius + 0.000000000000000001f);
+
+            }
+        }
+    }
+    
+    
+    for (int p = 0; p < particleLength; p++)
+    {
+        float dist = distance(_drugParticles[id.x].position, _particles[p].position);
+        if (dist != 0)
+        {
+            if (dist < (radius + drugParticleRadius + 0.000000000000000001f) * 0.5)
+            {
+                float3 normVec = normalize(_drugParticles[id.x].position - _particles[p].position);
+                float3 directionReflected = reflect(_drugParticles[id.x].velocity, normVec) + float3(0.000000000000000001f, 0.000000000000000001f, 0.000000000000000001f);
+                float3 normalDirectionReflected = directionReflected / abs(distance(float3(0, 0, 0), directionReflected));
+                float otherParticleVelcoity = abs(distance(float3(0, 0, 0), _particles[p].velocity));
+                float3 newVel = _drugParticles[id.x].velocity - 2 * (particleMass / (drugParticleMass + particleMass)) * dot(_drugParticles[id.x].velocity - _particles[p].velocity, normVec) * normVec;
+                drugVel = boundDamping * -1 * newVel;
+                
+                _drugParticles[id.x].position = _particles[p].position + normVec * (radius + drugParticleRadius + 0.000000000000000001f) * 0.5;
+
+            }
+        }
+    }
+    
+    /*
+    for (int k = 0; k < particleLength; k++)
+    {
+        float dist = distance(_particles[id.x].position, _particles[k].position);
+        if (dist != 0)
+        {
+            if (dist < 0.1)
+            {
+                vel = float3(0, 0, 10);
+
+            }
+        }
+
+    }*/
+    
+    /*
+    float3 colPt = float3(_collisionPoints[_particles[id.x].collPointsIndex].x, _collisionPoints[_particles[id.x].collPointsIndex].y, _collisionPoints[_particles[id.x].collPointsIndex].z);
+    float dist = distance(_particles[id.x].position, colPt);
+    if (dist < radius)
+    {
+        vel = boundDamping * -1 * _particles[id.x].directionReflected;
+        _particles[id.x].position = _particles[id.x].reflectedPosition * radius + colPt;
+    }
+    else
+    {
+        _particles[id.x].collisionOccured = 0;
+    }*/
+    
+    /*
+    for (int i = 0; i < collisionPointsLength; i++)
+    {
+        float dist = distance(_particles[id.x].position, _collisionPoints[i]);
+        if (dist < radius)
+        {
+            for (int k = 0; k < collisionNormalVecsLength; k += 2)
+            {
+                if (dist == _collisionNormalVecs[k].x)
+                {
+                    vel = boundDamping * -1 * _collisionNormalVecs[k + 1] * distance(vel, float3(0,0,0));
+                    _particles[id.x].position = _collisionNormalVecs[k] * radius + _collisionPoints[i];
+
+                }
+
+            }
+
+        }
+    }*/
+    
+    // Min Boundary Enforcements
+    if (_particles[id.x].position.x - radius < bottomLeft.x)
+    {
+        //vel.x *= boundDamping;
+        //_particles[id.x].position.x = bottomLeft.x + radius;
+        vel = float3(0, 0, 0);
+        _particles[id.x].position.x = topRight.x - radius;
+    }
+    if (_particles[id.x].position.y - radius < bottomLeft.y)
+    {
+        vel.y *= boundDamping;
+        _particles[id.x].position.y = bottomLeft.y + radius;
+    }
+    if (_particles[id.x].position.z - radius < bottomLeft.z)
+    {
+        vel.z *= boundDamping;
+        _particles[id.x].position.z = bottomLeft.z + radius;
+    }
+
+
+    // Max Boundary Enforcements
+    if (_particles[id.x].position.x + radius > topRight.x)
+    {
+        vel.x *= boundDamping;
+        _particles[id.x].position.x = topRight.x - radius;
+    }
+    if (_particles[id.x].position.y + radius > topRight.y)
+    {
+        vel.y *= boundDamping;
+        _particles[id.x].position.y = topRight.y - radius;
+    }
+    if (_particles[id.x].position.z + radius > topRight.z)
+    {
+        vel.z *= boundDamping;
+        _particles[id.x].position.z = topRight.z - radius;
+    }
+
+    
+    if (distance(_particles[id.x].position, spherePos) + radius < sphereRadius)
+    {
+        vel *= boundDamping;
+    }
+
+    float3 initFlowVel = float3(initialFlowRateForce.x, initialFlowRateForce.y, initialFlowRateForce.z);
+    //vel += initFlowVel;
+    
+    
+    if (vel.x > -100)
+    {
+        vel.x = initFlowVel.x;
+    }
+    
+    _drugParticles[id.x].velocity = drugVel + float3(0, 0, 0);
+    _particles[id.x].velocity = vel;
+
+}
+
+
+
+float StdKernel(float distanceSquared)
+{
+    float x = 1.0f - distanceSquared / radius2;
+    return 315.f / (64.f * pi * radius3) * x * x * x;
+}
+
+[numthreads(256, 1, 1)]
+void ComputeDensityPressure(uint3 id : SV_DISPATCHTHREADID)
+{
+
+    uint particleIndex = _particleIndices[id.x];
+
+    int3 cellIndex = GetCell(_particles[particleIndex].position);
+    float3 origin = _particles[particleIndex].position;
+    float sum = 0;
+
+    for (int i = -2; i <= 2; ++i)
+    {
+        for (int j = -2; j <= 2; ++j)
+        {
+            for (int k = -2; k <= 2; ++k)
+            {
+
+                int3 neighbourIndex = cellIndex + int3(i, j, k);
+                uint hashedNeighbourIndex = HashCell(neighbourIndex);
+                uint neighbourIterator = _cellOffsets[hashedNeighbourIndex];
+
+                while (neighbourIterator != 99999999 && neighbourIterator < particleLength)
+                {
+
+                    uint particleIndexB = _particleIndices[neighbourIterator];
+
+                    if (_particleCellIndices[particleIndexB] != hashedNeighbourIndex)
+                    {
+                        break;
+                    }
+
+                    Particle particleB = _particles[particleIndexB];
+
+                    float3 diff = origin - particleB.position;
+                    float distanceSquared = dot(diff, diff);
+
+                    if (radius2 * 0.004 > distanceSquared * 0.004)
+                    {
+
+                        sum += StdKernel(distanceSquared * 0.004); // Apply smoothing kernel
+
+                    }
+                    
+                    neighbourIterator++;
+
+                }
+            }
+        }
+    }
+
+    _particles[particleIndex].density = sum * particleMass + 0.000001f;
+    //_particles[particleIndex].pressure = gasConstant * (_particles[particleIndex].density - restDensity);
+    _particles[particleIndex].pressure = gasConstant * (_particles[particleIndex].density);
+
+}
+
+
+// Smoothing Functions for Compute Forces
+float SpikyKernelFirstDerivative(float distance)
+{
+    float x = 1.0f - distance / radius;
+    return -45.f / (pi * radius4) * x * x;
+}
+
+float SpikyKernelSecondDerivative(float distance)
+{
+    float x = 1.0f - distance / radius;
+    return 90.f / (pi * radius5) * x;
+}
+
+float3 SpikyKernelGradient(float distance, float3 direction)
+{
+    return SpikyKernelFirstDerivative(distance) * direction;
+}
+
+[numthreads(256, 1, 1)]
+void ComputeForces(uint3 id : SV_DISPATCHTHREADID)
+{
+
+    uint particleIndex = _particleIndices[id.x];
+    int3 cellIndex = GetCell(_particles[particleIndex].position);
+
+    float3 origin = _particles[particleIndex].position;
+    float density2 = _particles[particleIndex].density * _particles[particleIndex].density;
+    float mass2 = particleMass * particleMass;
+    float3 pressure = float3(0, 0, 0); // To be calculated
+    float3 visc = float3(0, 0, 0); // To be calculated 
+    
+    
+    for (int i = -2; i <= 2; ++i)
+    {
+        for (int j = -2; j <= 2; ++j)
+        {
+            for (int k = -2; k <= 2; ++k)
+            {
+
+                int3 neighbourIndex = cellIndex + int3(i, j, k);
+                uint hashedNeighbourIndex = HashCell(neighbourIndex);
+
+                uint neighbourIterator = _cellOffsets[hashedNeighbourIndex];
+
+                while (neighbourIterator != 99999999 && neighbourIterator < particleLength)
+                {
+
+                    uint particleIndexB = _particleIndices[neighbourIterator];
+                    if (_particleCellIndices[particleIndexB] != hashedNeighbourIndex)
+                    {
+                        break;
+                    }
+
+                    Particle particleB = _particles[particleIndexB];
+
+                    if (origin.x == particleB.position.x && origin.y == particleB.position.y && origin.z == particleB.position.z)
+                    {
+                        neighbourIterator++;
+                        continue;
+                    }
+
+                    float dist = distance(particleB.position, origin);
+                    if (dist < radius * 2)
+                    {
+                        float3 pressureGradientDirection = normalize(_particles[particleIndex].position - particleB.position);
+                        
+                        float3 _pressureContribution = mass2 * SpikyKernelGradient(dist, pressureGradientDirection);
+                        _pressureContribution *= (_particles[particleIndex].pressure / density2 + particleB.pressure / (particleB.density * particleB.density));
+
+                        float3 _viscosityContribution = viscosity * mass2 * (particleB.velocity - _particles[particleIndex].velocity) / particleB.density;
+                        _viscosityContribution *= SpikyKernelSecondDerivative(dist);
+                      
+
+                        pressure += _pressureContribution;
+                        visc += _viscosityContribution;
+                    }
+
+                    neighbourIterator++;
+
+                }
+
+            }
+        }
+    }
+
+    //Water
+    //_particles[particleIndex].currentForce = float3(0, -9.81 * particleMass, 0) - pressure + visc;
+    
+    //Air
+    float3 boyancyAcc = float3(0, -9.81 * particleMass, 0); // Boyanbce force counteracts that of gravity for air
+    //float3 velocity = _particles[particleIndex].velocity + initFlowVel;
+    
+    _particles[particleIndex].currentForce = -pressure + visc - _particles[particleIndex].velocity * particleMass * gasLocalVisc;
+
+    
+    float3 colDir = _particles[particleIndex].position - spherePos;
+    if (length(colDir) < sphereRadius)
+    {
+       _particles[particleIndex].currentForce += colDir * 30;
+    }
+}
