@@ -1,2 +1,2 @@
 # Unity-SPH-Fluid-Simulator
-A SPH simulator within Unity used to simulate the flow of air particles within the respitory bronchioles of a human lung. Also includes collision detection with wall mesh, other fluid particles, and other particles. 
+A SPH simulator within Unity used to simulate the flow of air particles within the respitory bronchioles of a human lung. Also includes collision detection with wall mesh, other fluid particles, and other particles. It was used in an attempt at determining the effects of asthma(Dry powder) drug MMAD and Density on the probablility of drug particle deposition at affected/ contricted respitory bronchioles, thus increasing the effectiveness of this form of site-specific drugs.
